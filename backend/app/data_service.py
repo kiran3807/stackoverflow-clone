@@ -1,19 +1,51 @@
 import json
 import os
-from typing import List, Optional, Dict, Any, cast
+from typing import List, Optional, Dict, Any, cast, Literal
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import select, insert, delete
-from .db.models import User, Question as DBQuestion, Answer as DBAnswer, Tag, Vote
+from .db.models import User, Question as DBQuestion, Answer as DBAnswer, Tag, Vote, AnalyticsLog
 from .models import QuestionSummary, PaginatedResponse, SearchRequest, SearchResponse
 import math
 from datetime import datetime
 from sqlalchemy import func
 from .db.models import question_tags
 from .models import QuestionCreate, AnswerCreate, TagCreate, UserCreate
+from pydantic import BaseModel
+
+class DbUpdatePayload(BaseModel):
+    text: str  # Natural language description of the update
+    table_name: str
+    update_type: Literal["insert", "update", "delete"]
+    values: Dict[str, Any]
 
 class DataService:
     def __init__(self, db: Session):
         self.db = db
+    
+    def _log_db_update(self, text: str, table_name: str, update_type: Literal["insert", "update", "delete"], values: Dict[str, Any], user_id: Optional[int] = None):
+        """Helper method to log database updates to AnalyticsLog"""
+        try:
+            payload = DbUpdatePayload(
+                text=text,
+                table_name=table_name,
+                update_type=update_type,
+                values=values
+            )
+            
+            log_entry = AnalyticsLog(
+                session_id=f"data_service_{datetime.utcnow().timestamp()}",
+                event_type="update_db",
+                event_data=payload.model_dump(),
+                timestamp=datetime.utcnow(),
+                user_id=user_id
+            )
+            
+            self.db.add(log_entry)
+            self.db.flush()  # Ensure it's written to the current transaction
+            
+        except Exception as e:
+            # Log the error but don't fail the main operation
+            pass  # Silent failure to avoid disrupting main operations
     
     def get_user_by_id(self, user_id: int) -> Optional[User]:
         """Get user by ID"""
@@ -226,6 +258,15 @@ class DataService:
             last_seen=datetime.utcnow()
         )
         self.db.add(user)
+        
+        # Log the database update
+        self._log_db_update(
+            text=f"Created new user '{name}' with email '{email}'",
+            table_name="users",
+            update_type="insert",
+            values={"name": name, "email": email, "reputation": 0, "is_active": True}
+        )
+        
         self.db.commit()
         self.db.refresh(user)
         return user
@@ -237,9 +278,6 @@ class DataService:
     def create_question(self, question: QuestionCreate, author_id: int):
         """Create a new question"""
         from .db.models import Question as DBQuestion, Tag
-        print(f"Creating question with: title={question.title}, body={question.body}, author_id={author_id}")
-        print(f"Question object fields: {dir(question)}")
-        print(f"Question dict: {question.model_dump()}")
         
         db_question = DBQuestion(
             title=question.title,
@@ -249,6 +287,16 @@ class DataService:
             updated_at=datetime.utcnow()
         )
         self.db.add(db_question)
+        
+        # Log the database update
+        self._log_db_update(
+            text=f"Created new question '{question.title}' by user {author_id}",
+            table_name="questions",
+            update_type="insert",
+            values={"title": question.title, "author_id": author_id, "tags": question.tags or []},
+            user_id=author_id
+        )
+        
         self.db.commit()
         self.db.refresh(db_question)
         
@@ -260,12 +308,31 @@ class DataService:
                 if not tag:
                     tag = Tag(name=tag_name)
                     self.db.add(tag)
+                    
+                    # Log tag creation
+                    self._log_db_update(
+                        text=f"Created new tag '{tag_name}' for question '{question.title}'",
+                        table_name="tags",
+                        update_type="insert",
+                        values={"name": tag_name},
+                        user_id=author_id
+                    )
+                    
                     self.db.commit()
                     self.db.refresh(tag)
                 
                 # Add tag to question via many-to-many relationship
                 if tag not in db_question.tags:
                     db_question.tags.append(tag)
+                    
+                    # Log tag association
+                    self._log_db_update(
+                        text=f"Associated tag '{tag_name}' with question '{question.title}'",
+                        table_name="question_tags",
+                        update_type="insert",
+                        values={"question_id": db_question.id, "tag_id": tag.id},
+                        user_id=author_id
+                    )
             
             self.db.commit()
             self.db.refresh(db_question)
@@ -303,6 +370,16 @@ class DataService:
             updated_at=datetime.utcnow()
         )
         self.db.add(db_answer)
+        
+        # Log the database update
+        self._log_db_update(
+            text=f"Created new answer for question {question_id} by user {user_id}",
+            table_name="answers",
+            update_type="insert",
+            values={"question_id": question_id, "author_id": user_id, "body_length": len(content)},
+            user_id=user_id
+        )
+        
         self.db.commit()
         self.db.refresh(db_answer)
         return db_answer
@@ -332,10 +409,28 @@ class DataService:
                 setattr(existing_vote, 'vote_type', vote_type)
                 setattr(existing_vote, 'created_at', datetime.utcnow())
                 
+                # Log the vote change
+                self._log_db_update(
+                    text=f"User {user_id} changed vote on question {question_id} from {current_vote_type} to {vote_type}",
+                    table_name="votes",
+                    update_type="update",
+                    values={"question_id": question_id, "user_id": user_id, "old_vote": current_vote_type, "new_vote": vote_type},
+                    user_id=user_id
+                )
+                
                 # Update question vote count
                 self.db.query(DBQuestion).filter(DBQuestion.id == question_id).update({
                     DBQuestion.votes: DBQuestion.votes + vote_delta
                 })
+                
+                # Log question vote count update
+                self._log_db_update(
+                    text=f"Updated question {question_id} vote count by {vote_delta} (vote change)",
+                    table_name="questions",
+                    update_type="update",
+                    values={"question_id": question_id, "vote_delta": vote_delta, "reason": "vote_change"},
+                    user_id=user_id
+                )
             # If user is trying to vote the same way again, do nothing (prevent duplicate)
             else:
                 return  # No change needed
@@ -348,11 +443,29 @@ class DataService:
             )
             self.db.add(new_vote)
             
+            # Log new vote
+            self._log_db_update(
+                text=f"User {user_id} voted {vote_type} on question {question_id}",
+                table_name="votes",
+                update_type="insert",
+                values={"question_id": question_id, "user_id": user_id, "vote_type": vote_type},
+                user_id=user_id
+            )
+            
             # Update question vote count
             vote_delta = 1 if vote_type == "up" else -1
             self.db.query(DBQuestion).filter(DBQuestion.id == question_id).update({
                 DBQuestion.votes: DBQuestion.votes + vote_delta
             })
+            
+            # Log question vote count update
+            self._log_db_update(
+                text=f"Updated question {question_id} vote count by {vote_delta} (new {vote_type}vote)",
+                table_name="questions",
+                update_type="update",
+                values={"question_id": question_id, "vote_delta": vote_delta, "reason": "new_vote"},
+                user_id=user_id
+            )
         
         self.db.commit()
     
@@ -381,10 +494,28 @@ class DataService:
                 setattr(existing_vote, 'vote_type', vote_type)
                 setattr(existing_vote, 'created_at', datetime.utcnow())
                 
+                # Log the vote change
+                self._log_db_update(
+                    text=f"User {user_id} changed vote on answer {answer_id} from {current_vote_type} to {vote_type}",
+                    table_name="votes",
+                    update_type="update",
+                    values={"answer_id": answer_id, "user_id": user_id, "old_vote": current_vote_type, "new_vote": vote_type},
+                    user_id=user_id
+                )
+                
                 # Update answer vote count
                 self.db.query(DBAnswer).filter(DBAnswer.id == answer_id).update({
                     DBAnswer.votes: DBAnswer.votes + vote_delta
                 })
+                
+                # Log answer vote count update
+                self._log_db_update(
+                    text=f"Updated answer {answer_id} vote count by {vote_delta} (vote change)",
+                    table_name="answers",
+                    update_type="update",
+                    values={"answer_id": answer_id, "vote_delta": vote_delta, "reason": "vote_change"},
+                    user_id=user_id
+                )
             # If user is trying to vote the same way again, do nothing (prevent duplicate)
             else:
                 return  # No change needed
@@ -397,11 +528,29 @@ class DataService:
             )
             self.db.add(new_vote)
             
+            # Log new vote
+            self._log_db_update(
+                text=f"User {user_id} voted {vote_type} on answer {answer_id}",
+                table_name="votes",
+                update_type="insert",
+                values={"answer_id": answer_id, "user_id": user_id, "vote_type": vote_type},
+                user_id=user_id
+            )
+            
             # Update answer vote count
             vote_delta = 1 if vote_type == "up" else -1
             self.db.query(DBAnswer).filter(DBAnswer.id == answer_id).update({
                 DBAnswer.votes: DBAnswer.votes + vote_delta
             })
+            
+            # Log answer vote count update
+            self._log_db_update(
+                text=f"Updated answer {answer_id} vote count by {vote_delta} (new {vote_type}vote)",
+                table_name="answers",
+                update_type="update",
+                values={"answer_id": answer_id, "vote_delta": vote_delta, "reason": "new_vote"},
+                user_id=user_id
+            )
         
         self.db.commit()
     
@@ -410,6 +559,16 @@ class DataService:
         question = self.get_question(question_id)
         if question:
             self.db.query(DBQuestion).filter(DBQuestion.id == question_id).update({DBQuestion.views: DBQuestion.views + 1})
+            
+            # Log the view increment
+            self._log_db_update(
+                text=f"Incremented view count for question {question_id}",
+                table_name="questions",
+                update_type="update",
+                values={"question_id": question_id, "view_increment": 1},
+                user_id=None  # Views are typically not tied to a specific user
+            )
+            
             self.db.commit()
     
     def get_site_stats(self) -> Dict[str, int]:
@@ -428,11 +587,22 @@ class DataService:
     def update_question(self, question_id: int, question: QuestionCreate):
         db_question = self.get_question(question_id)
         if db_question:
+            author_id = cast(int, db_question.author_id)
             self.db.query(DBQuestion).filter(DBQuestion.id == question_id).update({
                 DBQuestion.title: question.title,
                 DBQuestion.body: question.body,
                 DBQuestion.updated_at: datetime.utcnow()
             })
+            
+            # Log the question update
+            self._log_db_update(
+                text=f"Updated question {question_id}: title='{question.title}'",
+                table_name="questions",
+                update_type="update",
+                values={"question_id": question_id, "title": question.title, "body_length": len(question.body)},
+                user_id=author_id
+            )
+            
             self.db.commit()
             db_question = self.get_question(question_id)  # Refresh the object
         return db_question
@@ -509,6 +679,16 @@ class DataService:
     def create_tag(self, tag: TagCreate) -> Tag:
         db_tag = Tag(name=tag.name)
         self.db.add(db_tag)
+        
+        # Log the tag creation
+        self._log_db_update(
+            text=f"Created new tag '{tag.name}'",
+            table_name="tags",
+            update_type="insert",
+            values={"name": tag.name},
+            user_id=None  # Tag creation is typically system-level
+        )
+        
         self.db.commit()
         self.db.refresh(db_tag)
         return db_tag
@@ -545,6 +725,17 @@ class DataService:
             question_tags.c.tag_id == tag_id
         )
         result = self.db.execute(stmt)
+        
+        if result.rowcount > 0:
+            # Log the tag removal
+            self._log_db_update(
+                text=f"Removed tag {tag_id} from question {question_id}",
+                table_name="question_tags",
+                update_type="delete",
+                values={"question_id": question_id, "tag_id": tag_id},
+                user_id=None  # Tag removal might not always have a specific user context
+            )
+        
         self.db.commit()
         return result.rowcount > 0
 
@@ -613,6 +804,18 @@ class DataService:
         )
         
         self.db.add(comment)
+        
+        # Log the comment creation
+        target_type = "question" if question_id else "answer"
+        target_id = question_id if question_id else answer_id
+        self._log_db_update(
+            text=f"User {user_id} created comment on {target_type} {target_id}",
+            table_name="comments",
+            update_type="insert",
+            values={"author_id": user_id, "question_id": question_id, "answer_id": answer_id, "body_length": len(content)},
+            user_id=user_id
+        )
+        
         self.db.commit()
         self.db.refresh(comment)
         
@@ -651,9 +854,28 @@ class DataService:
         if existing_vote:
             # User is trying to vote again - remove the vote (toggle)
             self.db.delete(existing_vote)
+            
+            # Log vote removal
+            self._log_db_update(
+                text=f"User {user_id} removed upvote from comment {comment_id}",
+                table_name="comment_votes",
+                update_type="delete",
+                values={"comment_id": comment_id, "user_id": user_id},
+                user_id=user_id
+            )
+            
             self.db.query(DBComment).filter(DBComment.id == comment_id).update({
                 DBComment.votes: DBComment.votes - 1
             })
+            
+            # Log comment vote count update
+            self._log_db_update(
+                text=f"Decremented vote count for comment {comment_id} (vote removal)",
+                table_name="comments",
+                update_type="update",
+                values={"comment_id": comment_id, "vote_delta": -1, "reason": "vote_removal"},
+                user_id=user_id
+            )
         else:
             # Create new vote
             new_vote = CommentVote(
@@ -662,10 +884,28 @@ class DataService:
             )
             self.db.add(new_vote)
             
+            # Log new vote
+            self._log_db_update(
+                text=f"User {user_id} upvoted comment {comment_id}",
+                table_name="comment_votes",
+                update_type="insert",
+                values={"comment_id": comment_id, "user_id": user_id},
+                user_id=user_id
+            )
+            
             # Update comment vote count
             self.db.query(DBComment).filter(DBComment.id == comment_id).update({
                 DBComment.votes: DBComment.votes + 1
             })
+            
+            # Log comment vote count update
+            self._log_db_update(
+                text=f"Incremented vote count for comment {comment_id} (new upvote)",
+                table_name="comments",
+                update_type="update",
+                values={"comment_id": comment_id, "vote_delta": 1, "reason": "new_upvote"},
+                user_id=user_id
+            )
         
         self.db.commit()
     
@@ -703,8 +943,27 @@ class DataService:
             DBQuestion.votes: DBQuestion.votes + vote_delta
         })
         
+        # Log question vote count update
+        self._log_db_update(
+            text=f"Updated question {question_id} vote count by {vote_delta} (vote removal)",
+            table_name="questions",
+            update_type="update",
+            values={"question_id": question_id, "vote_delta": vote_delta, "reason": "vote_removal"},
+            user_id=user_id
+        )
+        
         # Delete the vote record
         self.db.delete(existing_vote)
+        
+        # Log vote removal
+        self._log_db_update(
+            text=f"User {user_id} removed {vote_type}vote from question {question_id}",
+            table_name="votes",
+            update_type="delete",
+            values={"question_id": question_id, "user_id": user_id, "vote_type": vote_type},
+            user_id=user_id
+        )
+        
         self.db.commit()
 
     def remove_answer_vote(self, answer_id: int, user_id: int, vote_type: str):
@@ -730,6 +989,25 @@ class DataService:
             DBAnswer.votes: DBAnswer.votes + vote_delta
         })
         
+        # Log answer vote count update
+        self._log_db_update(
+            text=f"Updated answer {answer_id} vote count by {vote_delta} (vote removal)",
+            table_name="answers",
+            update_type="update",
+            values={"answer_id": answer_id, "vote_delta": vote_delta, "reason": "vote_removal"},
+            user_id=user_id
+        )
+        
         # Delete the vote record
         self.db.delete(existing_vote)
+        
+        # Log vote removal
+        self._log_db_update(
+            text=f"User {user_id} removed {vote_type}vote from answer {answer_id}",
+            table_name="votes",
+            update_type="delete",
+            values={"answer_id": answer_id, "user_id": user_id, "vote_type": vote_type},
+            user_id=user_id
+        )
+        
         self.db.commit()

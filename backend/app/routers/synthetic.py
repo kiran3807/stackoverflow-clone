@@ -93,9 +93,13 @@ async def get_logs(
     if not session_id:
         raise HTTPException(status_code=400, detail="No session ID provided")
     
-    logs = db.query(AnalyticsLog).filter(
-        AnalyticsLog.session_id == session_id
-    ).order_by(AnalyticsLog.timestamp.desc()).all()
+    # Special case: if session_id is "all", return all logs
+    if session_id == "all":
+        logs = db.query(AnalyticsLog).order_by(AnalyticsLog.timestamp.desc()).all()
+    else:
+        logs = db.query(AnalyticsLog).filter(
+            AnalyticsLog.session_id == session_id
+        ).order_by(AnalyticsLog.timestamp.desc()).all()
     
     return {
         "logs": [
@@ -104,7 +108,7 @@ async def get_logs(
                 "event_type": log.event_type,  # Use the correct field name
                 "session_id": log.session_id,
                 "event_data": log.event_data,
-                "timestamp": log.timestamp.isoformat() if log.timestamp else None
+                "timestamp": log.timestamp.isoformat() if log.timestamp is not None else None
             }
             for log in logs
         ]
